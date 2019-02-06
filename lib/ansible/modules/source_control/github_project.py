@@ -62,15 +62,61 @@ original_message:
 message:
     description: The output message that the sample module generates
 '''
+try:
+    import github
+    HAS_GITHUB = True
+except ImportError:
+    HAS_GITHUB = False
 
 from ansible.module_utils.basic import AnsibleModule
+from ansible.module_utils._text import to_native
+
+
+def get_repo(owner, repository, owner_is_organization, connection):
+    if owner_is_organization:
+        o = connection.get_organization(owner)
+    else:
+        o = connection.get_user()
+    try:
+        return o.get_repo(repository)
+    except github.GithubException as err:
+        if err.status == 404:
+            return None
+        else:
+            raise err
+
+
+def create_repo(owner, repository, owner_is_organization, private, connection):
+    if owner_is_organization:
+        o = connection.get_organization(owner)
+    else:
+        o = connection.get_user()
+    o.create_repo(repository, private=private)
+
+
+def delete_repo():
+    print("deleting repo")
+
+
+def update_private_status():
+    print("updating private status")
+
 
 def run_module():
     # define available arguments/parameters a user can pass to the module
-    module_args = dict(
-        name=dict(type='str', required=True),
-        new=dict(type='bool', required=False, default=False)
-    )
+
+    module_args = {
+        'owner': {'required': True},
+        'repository': {'required': True},
+        'user': {'required': True},
+        'token': {'no_log': True},
+        'password': {'no_log': True},
+        'state': {'choices': ['present', 'absent'], 'default': 'present'},
+        'private': {'type': 'bool'},
+        'force': {'type': 'bool', 'default': False},
+        'owner_is_organization': {'type': 'bool', 'default': False},
+        'github_url': {'default': 'https://api.github.com'},
+    }
 
     # seed the result dict in the object
     # we primarily care about changed and state
@@ -89,7 +135,9 @@ def run_module():
     # supports check mode
     module = AnsibleModule(
         argument_spec=module_args,
-        supports_check_mode=True
+        supports_check_mode=True,
+        mutually_exclusive=(('password', 'token'),),
+        required_one_of=(("password", "token"),),
     )
 
     # if the user is working with this module in only check mode we do not
@@ -98,25 +146,39 @@ def run_module():
     if module.check_mode:
         return result
 
-    # manipulate or modify the state as needed (this is going to be the
-    # part where your module will do what it needs to do)
-    result['original_message'] = module.params['name']
-    result['message'] = 'goodbye'
+    if not HAS_GITHUB:
+        module.fail_json(msg="PyGithub required for this module")
 
-    # use whatever logic you need to determine whether or not this module
-    # made any modifications to your target
-    if module.params['new']:
-        result['changed'] = True
+    try:
+        github_conn = github.Github(
+            module.params["user"],
+            module.params.get("password") or module.params.get("token"),
+            base_url=module.params["github_url"])
 
-    # during the execution of the module, if there is an exception or a
-    # conditional state that effectively causes a failure, run
-    # AnsibleModule.fail_json() to pass in the message and the result
-    if module.params['name'] == 'fail me':
-        module.fail_json(msg='You requested this to fail', **result)
+        repo = get_repo(module.params["owner"], module.params["repository"],
+                        module.params["owner_is_organization"], github_conn)
+
+        if repo is None and module.params["state"] == "present":
+            create_repo(module.params["owner"], module.params["repository"], module.params["owner_is_organization"],
+                        module.params["private"], github_conn)
+            result["changed"] = True
+        elif repo is not None and module.params["state"] == "absent":
+            if module.params["force"]:
+                delete_repo()
+            else:
+                module.fail_json(msg="Expected repository %s to be absent" % (module.params["repository"]))
+            result["changed"] = True
+        elif repo is not None and repo.private != module.params["private"]:
+            update_private_status()
+            result["changed"] = True
+
+    except github.GithubException as err:
+        module.fail_json(msg="Github error : %s" % (to_native(err)))
 
     # in the event of a successful module execution, you will want to
     # simple AnsibleModule.exit_json(), passing the key/value results
     module.exit_json(**result)
+
 
 def main():
     run_module()
